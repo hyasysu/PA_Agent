@@ -12,7 +12,7 @@ from typing import Sequence
 @dataclass(frozen=True)
 class KlineBar:
     """A single OHLCV bar with sequence number and closed flag."""
-    seq: int           # 1 = newest (including forming bar), N = oldest
+    seq: int           # 1 = newest closed bar, N = oldest; 0 = forming bar (not counted)
     ts_open: float     # Unix timestamp in milliseconds (UTC) of bar open
     open: float
     high: float

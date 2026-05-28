@@ -165,21 +165,27 @@ def build_live_frame(
             return None
         raw = bars_raw[:n_closed]
 
-    rebased: list[KlineBar] = [
-        normalize_kline_bar(
-            KlineBar(
-                seq=i + 1,
-                ts_open=b.ts_open,
-                open=b.open,
-                high=b.high,
-                low=b.low,
-                close=b.close,
-                volume=b.volume,
-                closed=not (has_forming and i == 0),
+    rebased: list[KlineBar] = []
+    closed_idx = 0
+    for i, b in enumerate(raw):
+        is_forming = has_forming and i == 0
+        seq = 0 if is_forming else (closed_idx + 1)
+        if not is_forming:
+            closed_idx += 1
+        rebased.append(
+            normalize_kline_bar(
+                KlineBar(
+                    seq=seq,
+                    ts_open=b.ts_open,
+                    open=b.open,
+                    high=b.high,
+                    low=b.low,
+                    close=b.close,
+                    volume=b.volume,
+                    closed=not is_forming,
+                )
             )
         )
-        for i, b in enumerate(raw)
-    ]
     indicators = compute_indicators(rebased)
     return KlineFrame(
         symbol=symbol,

@@ -20,7 +20,7 @@ def test_defaults(tmp_path):
     assert s.general.last_timeframe == "15m"
     assert s.general.decision_stance == "balanced"
     assert s.general.decision_flow_auto_play is True
-    assert s.general.auto_resume_chart_after_analysis is True
+    assert s.general.auto_resume_chart_after_analysis is False
     assert p.exists(), "defaults should be written to disk"
 
 

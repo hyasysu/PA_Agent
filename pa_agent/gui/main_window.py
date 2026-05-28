@@ -1076,7 +1076,7 @@ class MainWindow(QMainWindow):
         settings = getattr(self._ctx, "settings", None)
         if settings is None:
             return True
-        return bool(getattr(settings.general, "auto_resume_chart_after_analysis", True))
+        return bool(getattr(settings.general, "auto_resume_chart_after_analysis", False))
 
     def _maybe_auto_resume_chart_after_analysis(self) -> bool:
         """Resume live chart refresh after analysis if settings allow."""

@@ -298,8 +298,8 @@ class ChartWidget(pg.PlotWidget):
             self.addItem(candle)
             self._candle_items.append(candle)
 
-            # Sequence label — odd seq; always label forming bar
-            if bar.seq % 2 == 1 or forming:
+            # Sequence label — odd seq only; skip forming bar (seq=0)
+            if bar.seq > 0 and bar.seq % 2 == 1:
                 label_y = bar.high
                 seq_label = SeqLabelItem(
                     bar.seq,

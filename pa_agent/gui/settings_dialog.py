@@ -224,7 +224,7 @@ class SettingsDialog(QDialog):
         self._analysis_bar_count_spin.setValue(g.analysis_bar_count)
         self._refresh_interval_spin.setValue(g.refresh_interval_ms)
         self._auto_resume_chart_check.setChecked(
-            bool(getattr(g, "auto_resume_chart_after_analysis", True))
+            bool(getattr(g, "auto_resume_chart_after_analysis", False))
         )
         self._context_warning_spin.setValue(int(g.context_warning_threshold_pct))
         self._stream_font_spin.setValue(int(getattr(g, "stream_pane_font_pt", 11)))

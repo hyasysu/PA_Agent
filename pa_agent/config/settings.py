@@ -69,7 +69,7 @@ class GeneralSettings(BaseModel):
     #: K 线图上 #序号 标签的字号（pt）
     chart_seq_label_font_pt: int = Field(default=7, ge=6, le=24)
     #: 两阶段分析结束后是否自动恢复 K 线图表实时刷新
-    auto_resume_chart_after_analysis: bool = True
+    auto_resume_chart_after_analysis: bool = False
 
     @field_validator("last_data_source", mode="before")
     @classmethod
