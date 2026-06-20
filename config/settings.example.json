@@ -43,5 +43,12 @@
     "app_id": "",
     "app_secret": "",
     "notify_on_order_only": true
+  },
+  "pushplus": {
+    "enabled": true,
+    "token": ""
+  },
+  "tushare": {
+    "token": ""
   }
 }

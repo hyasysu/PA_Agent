@@ -261,11 +261,8 @@ def apply_qclaw_provider_to_settings(
             "3. gateway.auth.token 已配置"
         )
 
-    model_arg = (
-        (preferred_model or "").strip()
-        if is_openclaw_model(preferred_model)
-        else _PUBLIC_GATEWAY_MODEL
-    )
+    model_hint = (preferred_model or getattr(settings.provider, "model", "") or "").strip()
+    model_arg = model_hint if is_openclaw_model(model_hint) else _PUBLIC_GATEWAY_MODEL
     resolved = qclaw_provider_settings(model=model_arg, prefer_relay=False)
     if resolved is None:
         return "QClaw 配置读取失败。"

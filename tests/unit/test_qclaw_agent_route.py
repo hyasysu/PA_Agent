@@ -132,6 +132,64 @@ def test_apply_qclaw_provider_forces_agent_model() -> None:
     assert settings.provider.base_url == "http://127.0.0.1:58579/v1"
 
 
+def test_apply_qclaw_provider_on_load_keeps_sub_agent_alias() -> None:
+    """Startup sync (no preferred_model) must preserve openclaw/<gateway-alias>."""
+    from pa_agent.config.settings import Settings
+
+    settings = Settings()
+    settings.provider.model = "openclaw/main"
+    settings.provider.base_url = "http://127.0.0.1:58579/v1"
+
+    with patch(
+        "pa_agent.ai.qclaw_connector.qclaw_provider_settings",
+    ) as resolve:
+        resolve.return_value = type(
+            "P",
+            (),
+            {
+                "model": "openclaw/main",
+                "base_url": "http://127.0.0.1:58579/v1",
+                "api_key": "tok",
+                "thinking": True,
+                "reasoning_effort": "max",
+                "context_window": 2_000_000,
+            },
+        )()
+        with patch("pa_agent.ai.qclaw_connector.detect_qclaw", return_value=True):
+            with patch(
+                "pa_agent.ai.qclaw_connector.qclaw_health_check",
+                return_value=(True, "ok"),
+            ):
+                err = apply_qclaw_provider_to_settings(settings)
+
+    assert err is None
+    resolve.assert_called_once_with(model="openclaw/main", prefer_relay=False)
+    assert settings.provider.model == "openclaw/main"
+
+
+def test_sync_workbuddy_on_load_keeps_submodel() -> None:
+    """sync_workbuddy_provider_on_load must not strip openclaw_wb/<api-model>."""
+    from pathlib import Path
+
+    from pa_agent.ai.workbuddy_connector import sync_workbuddy_provider_on_load
+    from pa_agent.config.settings import Settings
+
+    settings = Settings()
+    settings.provider.model = "openclaw_wb/deepseek-v4-flash"
+    settings.provider.base_url = "https://copilot.tencent.com/v2"
+    settings.provider.api_key = "wb-token"
+
+    with patch("pa_agent.ai.workbuddy_connector.detect_workbuddy", return_value=True), patch(
+        "pa_agent.ai.workbuddy_connector.apply_workbuddy_provider_to_settings"
+    ) as apply, patch("pa_agent.config.settings.save_settings") as save:
+        apply.return_value = None
+        sync_workbuddy_provider_on_load(settings, save_path=Path("settings.json"))
+        apply.assert_called_once_with(settings)
+        save.assert_not_called()
+
+    assert settings.provider.model == "openclaw_wb/deepseek-v4-flash"
+
+
 def test_openclaw_model_never_selects_workbuddy_on_stale_copilot_base() -> None:
     """Stale copilot base_url must not hijack ``openclaw`` → QClaw routing."""
     from pa_agent.ai.workbuddy_connector import (

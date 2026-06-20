@@ -62,3 +62,31 @@ def test_openclaw_wb_overrides_user_url_and_key() -> None:
     assert s.provider.base_url == "https://copilot.tencent.com/v2"
     assert s.provider.api_key == "tok-from-workbuddy"
 
+
+def test_openclaw_wb_on_load_keeps_submodel_from_settings() -> None:
+    """Startup sync (no preferred_model) must preserve openclaw_wb/<api-model>."""
+    s = Settings()
+    s.provider.model = "openclaw_wb/deepseek-v4-flash"
+    s.provider.base_url = "https://copilot.tencent.com/v2"
+
+    with patch("pa_agent.ai.workbuddy_connector.detect_workbuddy", return_value=True), patch(
+        "pa_agent.ai.workbuddy_connector.workbuddy_provider_settings"
+    ) as resolve, patch(
+        "pa_agent.ai.workbuddy_connector.workbuddy_health_check",
+        return_value=(True, "ok"),
+    ):
+        resolved = MagicMock()
+        resolved.model = "openclaw_wb/deepseek-v4-flash"
+        resolved.base_url = "https://copilot.tencent.com/v2"
+        resolved.api_key = "tok-from-workbuddy"
+        resolved.thinking = True
+        resolved.reasoning_effort = "max"
+        resolved.context_window = 2_000_000
+        resolve.return_value = resolved
+
+        err = apply_workbuddy_provider_to_settings(s)
+        assert err is None
+        resolve.assert_called_once_with(model="openclaw_wb/deepseek-v4-flash")
+
+    assert s.provider.model == "openclaw_wb/deepseek-v4-flash"
+

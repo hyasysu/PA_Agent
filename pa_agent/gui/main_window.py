@@ -674,7 +674,7 @@ class MainWindow(QMainWindow):
         if settings is not None:
             interval_ms = getattr(settings.general, "refresh_interval_ms", 1000)
             n_bars = self._analysis_bar_count()
-        if self._current_data_source_kind() in ("akshare", "eastmoney") and interval_ms < 2500:
+        if self._current_data_source_kind() in ("akshare", "eastmoney", "tushare") and interval_ms < 2500:
             interval_ms = 2500
 
         self._refresh_cancel_token = CancelToken()
@@ -1016,7 +1016,7 @@ class MainWindow(QMainWindow):
             line.setPlaceholderText(
                 "A股 6 位 / 港股 1810 / 名称 小米集团；交易所可自动；或 XAUUSD+OANDA"
             )
-        elif kind in ("akshare", "eastmoney"):
+        elif kind in ("akshare", "eastmoney", "tushare"):
             line.setPlaceholderText("A股 6 位代码，如 600519；指数 000300 或 sh000300")
         else:
             line.setPlaceholderText("输入 MT5 品种名，如 XAUUSDm…")
@@ -3121,9 +3121,10 @@ class MainWindow(QMainWindow):
                 except Exception as _exc:  # noqa: BLE001
                     logger.warning("Trade record logging failed: %s", _exc)
 
-                # ── 飞书通知：下单信号推送 ─────────────────────────────────────
+                # ── 下单信号推送（飞书 + PushPlus，互不影响）──────────────────
                 try:
-                    from pa_agent.notify.feishu_notifier import send_order_signal
+                    from pa_agent.notify.feishu_notifier import send_order_signal as send_feishu_order
+                    from pa_agent.notify.pushplus_notifier import send_order_signal as send_pushplus_order
                     from pa_agent.records.trade_logger import _TRADE_RECORDS_DIR
 
                     # 找本次交易记录生成的最新 PNG（按修改时间倒序取第一个）
@@ -3137,7 +3138,7 @@ class MainWindow(QMainWindow):
                     )
                     _latest_img = _candidates[0] if _candidates else None
 
-                    send_order_signal(
+                    send_feishu_order(
                         decision_inner=inner,
                         stage2_full=decision,
                         symbol=_meta_symbol,
@@ -3145,8 +3146,15 @@ class MainWindow(QMainWindow):
                         chart_image_path=_latest_img,
                         settings=settings,
                     )
-                except Exception as _feishu_exc:  # noqa: BLE001
-                    logger.warning("飞书通知失败（不影响主流程）: %s", _feishu_exc)
+                    send_pushplus_order(
+                        decision_inner=inner,
+                        stage2_full=decision,
+                        symbol=_meta_symbol,
+                        timeframe=_meta_timeframe,
+                        settings=settings,
+                    )
+                except Exception as _notify_exc:  # noqa: BLE001
+                    logger.warning("下单信号通知失败（不影响主流程）: %s", _notify_exc)
 
             elif getattr(self, "_demo_mode", False):
                 self._present_decision_flow_playback(force_play=True)

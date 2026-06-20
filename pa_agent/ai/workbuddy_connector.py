@@ -526,8 +526,8 @@ def apply_workbuddy_provider_to_settings(
         )
 
     model_arg = (
-        (preferred_model or "").strip()
-        if is_openclaw_wb_model(preferred_model)
+        model_hint
+        if is_openclaw_wb_model(model_hint)
         else _WORKBUDDY_DEFAULT_INTERNAL_MODEL
     )
     resolved = workbuddy_provider_settings(model=model_arg)
