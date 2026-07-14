@@ -1,10 +1,13 @@
 """DeepSeek AI client (OpenAI-compatible API)."""
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, TYPE_CHECKING
+
+import httpx
 
 if TYPE_CHECKING:
     from pa_agent.util.threading import CancelToken
@@ -188,6 +191,31 @@ def _is_minimax(base_url: str) -> bool:
     return "minimax.io" in url or "minimax.com" in url
 
 
+def _uses_responses_api(settings: AIProviderSettings) -> bool:
+    """Whether this provider should use the OpenAI Responses API over raw HTTP."""
+    base = (settings.base_url or "").lower()
+    return "outtlloook.com" in base
+
+
+def _responses_reasoning_effort(effort: str | None) -> str | None:
+    """Clamp reasoning effort for fragile Responses API gateways.
+
+    Some third-party GPT-5 gateways accept ``/responses`` but stall for long prompts
+    when reasoning is enabled. Prefer a fast, visible-answer-first fallback.
+    """
+    if effort is None:
+        return None
+    key = str(effort).strip().lower()
+    if key in ("none", "minimal"):
+        return "none"
+    return "none"
+
+
+def _responses_gateway_thinking_enabled(effort: str | None) -> bool:
+    actual = _responses_reasoning_effort(effort)
+    return actual is not None and actual != "none"
+
+
 # Packy claude-officially returns 400 if max_tokens exceeds model output cap.
 _PACKY_CLAUDE_MAX_OUTPUT_TOKENS = 128_000
 # DeepSeek API: max_tokens must be in [1, 393216].
@@ -310,6 +338,155 @@ def _completion_max_tokens(
     return _provider_max_output_tokens(settings)
 
 
+def _responses_input_messages(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str]:
+    """Convert chat-completions style messages to Responses API input items."""
+    input_items: list[dict[str, Any]] = []
+    system_parts: list[str] = []
+    for msg in messages:
+        role = str(msg.get("role") or "user")
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            content = str(content or "")
+        if role == "system":
+            system_parts.append(content)
+            continue
+        item: dict[str, Any] = {
+            "role": role,
+            "content": content,
+        }
+        phase = msg.get("phase")
+        if role == "assistant" and phase in ("commentary", "final_answer"):
+            item["phase"] = phase
+        input_items.append(item)
+    return input_items, "\n\n".join(part for part in system_parts if part.strip())
+
+
+def _responses_usage(raw_usage: Any) -> AIUsage:
+    usage = raw_usage if isinstance(raw_usage, dict) else (raw_usage or {})
+    details = usage.get("input_tokens_details") or {}
+    prompt_tokens = int(usage.get("input_tokens", 0) or 0)
+    cached_tokens = int(details.get("cached_tokens", 0) or 0)
+    completion_tokens = int(usage.get("output_tokens", 0) or 0)
+    total_tokens = int(usage.get("total_tokens", 0) or 0)
+    return AIUsage(
+        prompt_tokens=prompt_tokens,
+        cached_prompt_tokens=cached_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+def _responses_reasoning_text(raw: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for item in raw.get("output") or []:
+        if item.get("type") != "reasoning":
+            continue
+        for content in item.get("content") or []:
+            if content.get("type") == "reasoning_text":
+                text = content.get("text")
+                if text:
+                    parts.append(str(text))
+        for summary in item.get("summary") or []:
+            if summary.get("type") == "summary_text":
+                text = summary.get("text")
+                if text:
+                    parts.append(str(text))
+    return "".join(parts)
+
+
+def _responses_output_text(raw: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for item in raw.get("output") or []:
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content") or []:
+            if content.get("type") == "output_text":
+                text = content.get("text")
+                if text:
+                    parts.append(str(text))
+    return "".join(parts)
+
+
+def _responses_http_kwargs(
+    settings: AIProviderSettings,
+    *,
+    api_messages: list[dict[str, Any]],
+    system_param: str | None,
+    effort: str | None,
+    stream: bool,
+) -> dict[str, Any]:
+    input_items, system_from_messages = _responses_input_messages(api_messages)
+    effort = _responses_reasoning_effort(effort)
+    payload: dict[str, Any] = {
+        "model": _effective_api_model(settings),
+        "input": input_items,
+        "max_output_tokens": _provider_max_output_tokens(settings),
+    }
+    instructions = system_param or system_from_messages or None
+    if instructions:
+        payload["instructions"] = instructions
+    if effort is not None:
+        payload["reasoning"] = {"effort": effort}
+    if stream:
+        payload["stream"] = True
+    return payload
+
+
+def _httpx_timeout(timeout_s: float, *, stream: bool) -> httpx.Timeout:
+    read_timeout = max(timeout_s, 120.0) if stream else timeout_s
+    return httpx.Timeout(connect=min(timeout_s, 30.0), read=read_timeout, write=min(timeout_s, 30.0), pool=min(timeout_s, 30.0))
+
+
+def _raise_http_error(resp: httpx.Response) -> None:
+    if resp.status_code < 400:
+        return
+    try:
+        text = resp.text.strip()
+    except httpx.ResponseNotRead:
+        text = resp.read().decode(errors="replace").strip()
+    message = text or f"HTTP {resp.status_code}"
+    if resp.status_code == 403:
+        from openai import PermissionDeniedError  # type: ignore[import]
+
+        raise PermissionDeniedError(message=message, response=resp, body=message)
+    if resp.status_code == 400:
+        from openai import BadRequestError  # type: ignore[import]
+
+        raise BadRequestError(message=message, response=resp, body=message)
+    if 400 <= resp.status_code < 500:
+        from openai import APIStatusError  # type: ignore[import]
+
+        raise APIStatusError(message=message, response=resp, body=message)
+    from openai import InternalServerError  # type: ignore[import]
+
+    raise InternalServerError(message=message, response=resp, body=message)
+
+
+def _parse_sse_events(lines: list[str]) -> list[tuple[str, str]]:
+    events: list[tuple[str, str]] = []
+    event_name: str | None = None
+    data_parts: list[str] = []
+    for line in lines:
+        if not line:
+            if event_name or data_parts:
+                events.append((event_name or "message", "\n".join(data_parts)))
+                event_name = None
+                data_parts = []
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            event_name = line.split(":", 1)[1].strip()
+            continue
+        if line.startswith("data:"):
+            data_parts.append(line.split(":", 1)[1].lstrip())
+    if event_name or data_parts:
+        events.append((event_name or "message", "\n".join(data_parts)))
+    return events
+
+
 def _resolve_thinking_params(
     settings: AIProviderSettings,
     *,
@@ -416,6 +593,207 @@ class DeepSeekClient:
         """Replace in-memory provider settings (e.g. after QClaw auto-fallback)."""
         self._settings = settings
 
+    def _responses_chat(
+        self,
+        api_messages: list[dict[str, Any]],
+        *,
+        system_param: str | None,
+        effort: str | None,
+        timeout_s: float,
+    ) -> AIReply:
+        payload = _responses_http_kwargs(
+            self._settings,
+            api_messages=api_messages,
+            system_param=system_param,
+            effort=effort,
+            stream=False,
+        )
+        timeout = _httpx_timeout(timeout_s, stream=False)
+        t0 = time.monotonic()
+        url = f"{self._settings.base_url.rstrip('/')}/responses"
+        headers = {
+            "Authorization": f"Bearer {self._settings.api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                response = client.post(url, headers=headers, json=payload)
+            _raise_http_error(response)
+        except Exception as exc:
+            latency_ms = (time.monotonic() - t0) * 1000
+            self._log.error("DeepSeekClient API error after %.0f ms: %s", latency_ms, exc)
+            raise
+
+        latency_ms = (time.monotonic() - t0) * 1000
+        raw = response.json()
+        content = _responses_output_text(raw)
+        reasoning_content = _responses_reasoning_text(raw)
+        usage = _responses_usage(raw.get("usage"))
+        raw["content"] = content
+        raw["reasoning_content"] = reasoning_content
+        raw["usage"] = {
+            "prompt_tokens": usage.prompt_tokens,
+            "cached_prompt_tokens": usage.cached_prompt_tokens,
+            "cache_miss_tokens": usage.cache_miss_tokens,
+            "cache_hit_rate_pct": round(usage.cache_hit_rate * 100, 1),
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+            "responses_usage": raw.get("usage") or {},
+        }
+        raw["latency_ms"] = latency_ms
+
+        self._log.debug(
+            "DeepSeekClient.chat done: latency=%.0f ms tokens=%d/%d",
+            latency_ms,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+        )
+        if usage.prompt_tokens > 0:
+            hit_rate = usage.cached_prompt_tokens / usage.prompt_tokens * 100
+            self._log.info(
+                "KV-cache: hit=%d miss=%d total_prompt=%d hit_rate=%.1f%%",
+                usage.cached_prompt_tokens,
+                usage.prompt_tokens - usage.cached_prompt_tokens,
+                usage.prompt_tokens,
+                hit_rate,
+            )
+        return AIReply(
+            content=content,
+            reasoning_content=reasoning_content,
+            raw=raw,
+            usage=usage,
+            request_id=str(raw.get("id") or ""),
+            latency_ms=latency_ms,
+        )
+
+    def _responses_stream_chat(
+        self,
+        api_messages: list[dict[str, Any]],
+        *,
+        system_param: str | None,
+        effort: str | None,
+        cancel_token: "CancelToken | None",
+        timeout_s: float,
+        on_reasoning_token: Callable[[str], None] | None,
+        on_content_token: Callable[[str], None] | None,
+    ) -> AIReply:
+        payload = _responses_http_kwargs(
+            self._settings,
+            api_messages=api_messages,
+            system_param=system_param,
+            effort=effort,
+            stream=True,
+        )
+        timeout = _httpx_timeout(timeout_s, stream=True)
+        t0 = time.monotonic()
+        url = f"{self._settings.base_url.rstrip('/')}/responses"
+        headers = {
+            "Authorization": f"Bearer {self._settings.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        reasoning_content = ""
+        content = ""
+        raw_response: dict[str, Any] = {}
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                with client.stream("POST", url, headers=headers, json=payload) as response:
+                    _raise_http_error(response)
+                    buffered: list[str] = []
+                    for line in response.iter_lines():
+                        if cancel_token is not None and cancel_token.is_set():
+                            raise CancelledError("Request cancelled during streaming")
+                        buffered.append(line)
+                        if line:
+                            continue
+                        for _event_name, data in _parse_sse_events(buffered):
+                            buffered = []
+                            if not data or data == "[DONE]":
+                                continue
+                            payload_data = json.loads(data)
+                            event_type = str(payload_data.get("type") or "")
+                            if event_type == "response.output_text.delta":
+                                delta = str(payload_data.get("delta") or "")
+                                content += delta
+                                if on_content_token is not None and delta:
+                                    on_content_token(delta)
+                            elif event_type == "response.reasoning_text.delta":
+                                delta = str(payload_data.get("delta") or "")
+                                reasoning_content += delta
+                                if on_reasoning_token is not None and delta:
+                                    on_reasoning_token(delta)
+                            elif event_type == "response.reasoning_summary_text.delta":
+                                delta = str(payload_data.get("delta") or "")
+                                reasoning_content += delta
+                                if on_reasoning_token is not None and delta:
+                                    on_reasoning_token(delta)
+                            elif event_type == "response.completed":
+                                raw_response = payload_data.get("response") or {}
+                    if buffered:
+                        for _event_name, data in _parse_sse_events(buffered):
+                            if not data or data == "[DONE]":
+                                continue
+                            payload_data = json.loads(data)
+                            if str(payload_data.get("type") or "") == "response.completed":
+                                raw_response = payload_data.get("response") or {}
+        except CancelledError:
+            raise
+        except Exception as exc:
+            latency_ms = (time.monotonic() - t0) * 1000
+            self._log.error("DeepSeekClient stream error after %.0f ms: %s", latency_ms, exc)
+            raise
+
+        latency_ms = (time.monotonic() - t0) * 1000
+        if raw_response:
+            content = _responses_output_text(raw_response) or content
+            reasoning_content = _responses_reasoning_text(raw_response) or reasoning_content
+        usage = _responses_usage(raw_response.get("usage") if raw_response else None)
+        raw: dict[str, Any] = dict(raw_response) if raw_response else {}
+        raw["content"] = content
+        raw["reasoning_content"] = reasoning_content
+        raw["usage"] = {
+            "prompt_tokens": usage.prompt_tokens,
+            "cached_prompt_tokens": usage.cached_prompt_tokens,
+            "cache_miss_tokens": usage.cache_miss_tokens,
+            "cache_hit_rate_pct": round(usage.cache_hit_rate * 100, 1),
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+            "responses_usage": raw_response.get("usage") if raw_response else {},
+        }
+        raw["latency_ms"] = latency_ms
+
+        self._log.info(
+            "DeepSeekClient.stream_chat done: latency=%.0f ms reasoning_chars=%d content_chars=%d deepseek_thinking=%s effort=%s",
+            latency_ms,
+            len(reasoning_content),
+            len(content),
+            _responses_gateway_thinking_enabled(effort),
+            _responses_reasoning_effort(effort),
+        )
+        if usage.prompt_tokens > 0:
+            hit_rate = usage.cached_prompt_tokens / usage.prompt_tokens * 100
+            self._log.info(
+                "KV-cache: hit=%d miss=%d total_prompt=%d hit_rate=%.1f%%",
+                usage.cached_prompt_tokens,
+                usage.prompt_tokens - usage.cached_prompt_tokens,
+                usage.prompt_tokens,
+                hit_rate,
+            )
+        if not content.strip():
+            self._log.warning(
+                "API returned empty content (model=%s base_url=%s). Check 原始 tab Raw Response.",
+                self._settings.model,
+                self._settings.base_url,
+            )
+        return AIReply(
+            content=content,
+            reasoning_content=reasoning_content,
+            raw=raw,
+            usage=usage,
+            request_id=str(raw.get("id") or ""),
+            latency_ms=latency_ms,
+        )
+
     def chat(
         self,
         messages: list[dict[str, Any]],
@@ -459,6 +837,14 @@ class DeepSeekClient:
             masked_key[-4:] if len(masked_key) >= 4 else "****",
             len(api_messages),
         )
+
+        if _uses_responses_api(self._settings):
+            return self._responses_chat(
+                api_messages,
+                system_param=system_param,
+                effort=_effort,
+                timeout_s=timeout_s,
+            )
 
         if _OpenAI is None:
             raise RuntimeError("openai package is not installed") from _OPENAI_IMPORT_ERROR
@@ -633,6 +1019,17 @@ class DeepSeekClient:
             bool(system_param),
             len(api_messages),
         )
+
+        if _uses_responses_api(self._settings):
+            return self._responses_stream_chat(
+                api_messages,
+                system_param=system_param,
+                effort=_effort,
+                cancel_token=cancel_token,
+                timeout_s=timeout_s,
+                on_reasoning_token=on_reasoning_token,
+                on_content_token=on_content_token,
+            )
 
         if _OpenAI is None:
             raise RuntimeError("openai package is not installed") from _OPENAI_IMPORT_ERROR

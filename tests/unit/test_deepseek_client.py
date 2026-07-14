@@ -1,6 +1,7 @@
 """Unit tests for DeepSeekClient (task 6.5)."""
 from __future__ import annotations
 
+import json
 import sys
 import pytest
 from unittest.mock import MagicMock, patch, call
@@ -415,3 +416,131 @@ def test_mimo_chat_patches_tool_call_messages_before_send() -> None:
 
     sent_messages = mock_openai.return_value.chat.completions.create.call_args.kwargs["messages"]
     assert sent_messages[1]["reasoning_content"] == ""
+
+
+def test_boji_chat_uses_responses_http_api() -> None:
+    settings = _make_settings()
+    settings.base_url = "https://boji1334yd.outtlloook.com"
+    settings.model = "gpt-5.6-terra"
+    settings.reasoning_effort = "high"
+    client = DeepSeekClient(settings)
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "id": "resp-123",
+        "model": settings.model,
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": '{"ok":true}'}],
+            }
+        ],
+        "usage": {
+            "input_tokens": 10,
+            "input_tokens_details": {"cached_tokens": 3},
+            "output_tokens": 4,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 14,
+        },
+    }
+    mock_httpx = MagicMock()
+    mock_httpx.return_value.__enter__.return_value.post.return_value = mock_response
+
+    with patch("pa_agent.ai.deepseek_client.httpx.Client", mock_httpx):
+        reply = client.chat(
+            [
+                {"role": "system", "content": "SYS"},
+                {"role": "user", "content": "USR"},
+            ]
+        )
+
+    post_kwargs = mock_httpx.return_value.__enter__.return_value.post.call_args.kwargs
+    assert post_kwargs["json"]["instructions"] == "SYS"
+    assert post_kwargs["json"]["input"] == [{"role": "user", "content": "USR"}]
+    assert post_kwargs["json"]["reasoning"] == {"effort": "none"}
+    assert reply.content == '{"ok":true}'
+    assert reply.usage.prompt_tokens == 10
+    assert reply.usage.cached_prompt_tokens == 3
+    assert reply.usage.completion_tokens == 4
+
+
+def test_boji_stream_chat_uses_responses_http_api() -> None:
+    settings = _make_settings()
+    settings.base_url = "https://boji1334yd.outtlloook.com"
+    settings.model = "gpt-5.6-terra"
+    settings.reasoning_effort = "medium"
+    client = DeepSeekClient(settings)
+
+    lines = iter(
+        [
+            "event: response.reasoning_text.delta",
+            'data: {"type":"response.reasoning_text.delta","delta":"think "}',
+            "",
+            "event: response.output_text.delta",
+            'data: {"type":"response.output_text.delta","delta":"answer"}',
+            "",
+            "event: response.completed",
+            "data: "
+            + json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp-456",
+                        "model": settings.model,
+                        "output": [
+                            {
+                                "type": "reasoning",
+                                "content": [{"type": "reasoning_text", "text": "think "}],
+                                "summary": [],
+                            },
+                            {
+                                "type": "message",
+                                "content": [{"type": "output_text", "text": "answer"}],
+                            },
+                        ],
+                        "usage": {
+                            "input_tokens": 12,
+                            "input_tokens_details": {"cached_tokens": 2},
+                            "output_tokens": 5,
+                            "output_tokens_details": {"reasoning_tokens": 1},
+                            "total_tokens": 17,
+                        },
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            "",
+        ]
+    )
+
+    response_ctx = MagicMock()
+    response_ctx.__enter__.return_value = response_ctx
+    response_ctx.__exit__.return_value = None
+    response_ctx.status_code = 200
+    response_ctx.iter_lines.return_value = lines
+
+    client_ctx = MagicMock()
+    client_ctx.__enter__.return_value = client_ctx
+    client_ctx.__exit__.return_value = None
+    client_ctx.stream.return_value = response_ctx
+
+    mock_httpx = MagicMock(return_value=client_ctx)
+    reasoning_chunks: list[str] = []
+    content_chunks: list[str] = []
+
+    with patch("pa_agent.ai.deepseek_client.httpx.Client", mock_httpx):
+        reply = client.stream_chat(
+            [{"role": "user", "content": "hi"}],
+            on_reasoning_token=reasoning_chunks.append,
+            on_content_token=content_chunks.append,
+        )
+
+    stream_kwargs = client_ctx.stream.call_args.kwargs
+    assert stream_kwargs["json"]["stream"] is True
+    assert stream_kwargs["json"]["reasoning"] == {"effort": "none"}
+    assert reasoning_chunks == ["think "]
+    assert content_chunks == ["answer"]
+    assert reply.reasoning_content == "think "
+    assert reply.content == "answer"
+    assert reply.usage.total_tokens == 17
